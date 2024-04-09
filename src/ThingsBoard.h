@@ -4,6 +4,7 @@
 // Local includes.
 #include "Attribute_Request_Callback.h"
 #include "Constants.h"
+#include "Gateway_RPC_Callback.h"
 #include "Helper.h"
 #include "IMQTT_Client.h"
 #include "OTA_Handler.h"
@@ -13,7 +14,6 @@
 #include "Shared_Attribute_Callback.h"
 #include "ThingsBoardDefaultLogger.h"
 #include "Vector.h"
-
 
 // Library includes.
 #if THINGSBOARD_ENABLE_STREAM_UTILS
@@ -74,6 +74,18 @@ constexpr char PROV_RESPONSE_TOPIC[] PROGMEM = "/provision/response";
 constexpr char PROV_RESPONSE_TOPIC[] = "/provision/response";
 #endif // THINGSBOARD_ENABLE_PROGMEM
 
+// MQTT Gateway API topics and device connection message format.
+#if THINGSBOARD_ENABLE_PROGMEM
+constexpr char GATEWAY_CONNECT_TOPIC[] PROGMEM              = "v1/gateway/connect";
+constexpr char GATEWAY_DISCONNECT_TOPIC[] PROGMEM           = "v1/gateway/disconnect";
+constexpr char GATEWAY_RPC_TOPIC[] PROGMEM                  = "v1/gateway/rpc";
+constexpr char GATEWAY_CONNECT_DISCONNECT_PAYLOAD[] PROGMEM = "{\"device\":\"%s\"}";
+#else
+constexpr char GATEWAY_CONNECT_TOPIC[]    = "v1/gateway/connect";
+constexpr char GATEWAY_DISCONNECT_TOPIC[] = "v1/gateway/disconnect";
+constexpr char GATEWAY_RPC_TOPIC[]        = "v1/gateway/rpc";
+#endif // THINGSBOARD_ENABLE_PROGMEM
+
 // Default login data.
 #if THINGSBOARD_ENABLE_PROGMEM
 constexpr char PROV_ACCESS_TOKEN[] PROGMEM = "provision";
@@ -110,6 +122,21 @@ constexpr char RPC_EMPTY_PARAMS_VALUE[] PROGMEM = "{}";
 constexpr char RPC_METHOD_KEY[]         = "method";
 constexpr char RPC_PARAMS_KEY[]         = "params";
 constexpr char RPC_EMPTY_PARAMS_VALUE[] = "{}";
+#endif // THINGSBOARD_ENABLE_PROGMEM
+
+// MQTT Gateway API RPC keys.
+#if THINGSBOARD_ENABLE_PROGMEM
+constexpr char GATEWAY_RPC_DEVICE_KEY[] PROGMEM = "device";
+constexpr char GATEWAY_RPC_DATA_KEY[] PROGMEM   = "data";
+constexpr char GATEWAY_RPC_METHOD_KEY[] PROGMEM = "method";
+constexpr char GATEWAY_RPC_PARAMS_KEY[] PROGMEM = "params";
+constexpr char GATEWAY_RPC_ID_KEY[] PROGMEM     = "id";
+#else
+constexpr char GATEWAY_RPC_DEVICE_KEY[] = "device";
+constexpr char GATEWAY_RPC_DATA_KEY[]   = "data";
+constexpr char GATEWAY_RPC_METHOD_KEY[] = "method";
+constexpr char GATEWAY_RPC_PARAMS_KEY[] = "params";
+constexpr char GATEWAY_RPC_ID_KEY[]     = "id";
 #endif // THINGSBOARD_ENABLE_PROGMEM
 
 // Log messages.
@@ -377,8 +404,8 @@ class ThingsBoardSized {
   /// @param bufferingSize Amount of bytes allocated to speed up serialization, default =
   /// Default_Buffering_Size
   inline ThingsBoardSized(IMQTT_Client& client, const uint16_t& bufferSize = Default_Payload,
-                          const size_t& maxStackSize  = Default_Max_Stack_Size,
-                          const size_t& bufferingSize = Default_Buffering_Size)
+    const size_t& maxStackSize  = Default_Max_Stack_Size,
+    const size_t& bufferingSize = Default_Buffering_Size)
       : m_client(client)
       , m_max_stack(maxStackSize)
       , m_buffering_size(bufferingSize)
@@ -387,6 +414,7 @@ class ThingsBoardSized {
       , m_shared_attribute_update_callbacks()
       , m_attribute_request_callbacks()
       , m_provision_callback()
+      , m_gateway_rpc_callback()
       , m_request_id(0U)
 #if THINGSBOARD_ENABLE_OTA
       , m_fw_callback(nullptr)
@@ -394,8 +422,8 @@ class ThingsBoardSized {
       , m_change_buffer_size(false)
       , m_ota(std::bind(&ThingsBoardSized::Publish_Chunk_Request, this, std::placeholders::_1),
               std::bind(&ThingsBoardSized::Firmware_Send_State, this, std::placeholders::_1,
-                        std::placeholders::_2),
-              std::bind(&ThingsBoardSized::Firmware_OTA_Unsubscribe, this))
+            std::placeholders::_2),
+          std::bind(&ThingsBoardSized::Firmware_OTA_Unsubscribe, this))
 #endif // THINGSBOARD_ENABLE_OTA
   {
     setBufferSize(bufferSize);
@@ -403,10 +431,10 @@ class ThingsBoardSized {
     // Initalize callback.
 #if THINGSBOARD_ENABLE_STL
     m_client.set_callback(std::bind(&ThingsBoardSized::onMQTTMessage,
-                                    this,
-                                    std::placeholders::_1,
-                                    std::placeholders::_2,
-                                    std::placeholders::_3));
+      this,
+      std::placeholders::_1,
+      std::placeholders::_2,
+      std::placeholders::_3));
 #else
     m_client.set_callback(ThingsBoardSized::onStaticMQTTMessage);
     m_subscribedInstance = this;
@@ -487,6 +515,8 @@ class ThingsBoardSized {
     this->Attributes_Request_Unsubscribe();
     // Cleanup all provision requests
     this->Provision_Unsubscribe();
+    // Cleanup MQTT Gateway RPC subscription
+    this->Gateway_RPC_Unsubscribe();
     // Stop any ongoing Firmware update,
     // which will in turn cleanup the internal member variables of the OTAHandler class
     // as well as all firmware subscriptions
@@ -529,6 +559,67 @@ class ThingsBoardSized {
   /// @return Whether sending or receiving the oustanding the messages was successful or not
   inline bool loop() { return m_client.loop(); }
 
+  inline bool Gateway_Device_Connect(const char* device_name) {
+    if (device_name == nullptr) {
+      return false;
+    }
+
+    char buffer
+      [JSON_STRING_SIZE(strlen(GATEWAY_CONNECT_DISCONNECT_PAYLOAD)) +
+       JSON_STRING_SIZE(strlen(device_name))];
+
+    snprintf(buffer, sizeof(buffer), GATEWAY_CONNECT_DISCONNECT_PAYLOAD, device_name);
+
+    if (!m_client.publish(
+          GATEWAY_CONNECT_TOPIC, reinterpret_cast<const uint8_t*>(buffer), strlen(buffer))) {
+#ifdef THINGSBOARD_ENABLE_DEBUG
+      Logger::log("Failed to publish gateway connect message");
+#endif
+      return false;
+    }
+
+    return true;
+  }
+
+  inline bool Gateway_Device_Disconnect(const char* device_name) {
+    if (device_name == nullptr) {
+      return false;
+    }
+
+    char buffer
+      [JSON_STRING_SIZE(strlen(GATEWAY_CONNECT_DISCONNECT_PAYLOAD)) +
+       JSON_STRING_SIZE(strlen(device_name))];
+
+    snprintf(buffer, sizeof(buffer), GATEWAY_CONNECT_DISCONNECT_PAYLOAD, device_name);
+
+    if (!m_client.publish(
+          GATEWAY_DISCONNECT_TOPIC, reinterpret_cast<const uint8_t*>(buffer), strlen(buffer))) {
+#ifdef THINGSBOARD_ENABLE_DEBUG
+      Logger::log("Failed to publish gateway disconnect message");
+#endif
+      return false;
+    }
+
+    return true;
+  }
+
+  inline bool Gateway_RPC_Subscribe(const Gateway_RPC_Callback& callback) {
+    if (!m_client.subscribe(GATEWAY_RPC_TOPIC)) {
+#ifdef THINGSBOARD_ENABLE_DEBUG
+      Logger::log("Failed to subscribe to gateway rpc topic");
+#endif
+      return false;
+    }
+
+    m_gateway_rpc_callback = callback;
+    return true;
+  }
+
+  inline bool Gateway_RPC_Unsubscribe() {
+    m_gateway_rpc_callback = Gateway_RPC_Callback();
+    return m_client.unsubscribe(GATEWAY_RPC_TOPIC);
+  }
+
   /// @brief Attempts to send key value pairs from custom source over the given topic to the server
   /// @tparam TSource Source class that should be used to serialize the json that is sent to the
   /// server
@@ -563,7 +654,7 @@ class ThingsBoardSized {
     if (m_client.get_buffer_size() < jsonSize) {
 #if THINGSBOARD_ENABLE_DEBUG
       char message[JSON_STRING_SIZE(strlen(SEND_MESSAGE)) + JSON_STRING_SIZE(strlen(topic)) +
-                   JSON_STRING_SIZE(strlen(SEND_SERIALIZED))];
+         JSON_STRING_SIZE(strlen(SEND_SERIALIZED))];
       snprintf_P(message, sizeof(message), SEND_MESSAGE, topic, SEND_SERIALIZED);
       Logger::log(message);
 #endif // THINGSBOARD_ENABLE_DEBUG
@@ -1100,7 +1191,7 @@ class ThingsBoardSized {
 #if !THINGSBOARD_ENABLE_DYNAMIC
     const size_t size = std::distance(first_itr, last_itr);
     if (m_shared_attribute_update_callbacks.size() + size >
-        m_shared_attribute_update_callbacks.capacity()) {
+      m_shared_attribute_update_callbacks.capacity()) {
       Logger::log(MAX_SHARED_ATT_UPDATE_EXCEEDED);
       return false;
     }
@@ -1131,7 +1222,7 @@ class ThingsBoardSized {
                                           const size_t& callbacksSize) {
 #if !THINGSBOARD_ENABLE_DYNAMIC
     if (m_shared_attribute_update_callbacks.size() + callbacksSize >
-        m_shared_attribute_update_callbacks.capacity()) {
+      m_shared_attribute_update_callbacks.capacity()) {
       Logger::log(MAX_SHARED_ATT_UPDATE_EXCEEDED);
       return false;
     }
@@ -1159,7 +1250,7 @@ class ThingsBoardSized {
   inline bool Shared_Attributes_Subscribe(const Shared_Attribute_Callback& callback) {
 #if !THINGSBOARD_ENABLE_DYNAMIC
     if (m_shared_attribute_update_callbacks.size() + 1U >
-        m_shared_attribute_update_callbacks.capacity()) {
+      m_shared_attribute_update_callbacks.capacity()) {
       Logger::log(MAX_SHARED_ATT_UPDATE_EXCEEDED);
       return false;
     }
@@ -1267,7 +1358,7 @@ class ThingsBoardSized {
   /// @return Whether requesting the given callback was successful or not
   inline bool Attributes_Request(const Attribute_Request_Callback& callback,
                                  const char* attributeRequestKey,
-                                 const char* attributeResponseKey) {
+    const char* attributeResponseKey) {
 #if THINGSBOARD_ENABLE_STL
     const std::vector<const char*>& attributes = callback.Get_Attributes();
 
@@ -1441,7 +1532,7 @@ class ThingsBoardSized {
     const char* curr_fw_version = m_fw_callback->Get_Firmware_Version();
 
     if (fw_title == nullptr || fw_version == nullptr || curr_fw_title == nullptr ||
-        curr_fw_version == nullptr || fw_algorithm.empty() || fw_checksum.empty()) {
+      curr_fw_version == nullptr || fw_algorithm.empty() || fw_checksum.empty()) {
       Logger::log(EMPTY_FW);
       Firmware_Send_State(FW_STATE_FAILED, EMPTY_FW);
       return;
@@ -1477,7 +1568,7 @@ class ThingsBoardSized {
       fw_checksum_algorithm = mbedtls_md_type_t::MBEDTLS_MD_SHA512;
     } else {
       char message[JSON_STRING_SIZE(strlen(FW_CHKS_ALGO_NOT_SUPPORTED)) +
-                   JSON_STRING_SIZE(fw_algorithm.size())];
+         JSON_STRING_SIZE(fw_algorithm.size())];
       snprintf_P(message, sizeof(message), FW_CHKS_ALGO_NOT_SUPPORTED, fw_algorithm.c_str());
       Logger::log(message);
       Firmware_Send_State(FW_STATE_FAILED, message);
@@ -1492,7 +1583,7 @@ class ThingsBoardSized {
     Logger::log(PAGE_BREAK);
     Logger::log(NEW_FW);
     char firmware[JSON_STRING_SIZE(strlen(FROM_TOO)) + JSON_STRING_SIZE(strlen(curr_fw_version)) +
-                  JSON_STRING_SIZE(strlen(fw_version))];
+       JSON_STRING_SIZE(strlen(fw_version))];
     snprintf_P(firmware, sizeof(firmware), FROM_TOO, curr_fw_version, fw_version);
     Logger::log(firmware);
     Logger::log(DOWNLOADING_FW);
@@ -1555,6 +1646,10 @@ class ThingsBoardSized {
     if (!m_shared_attribute_update_callbacks.empty()) {
       m_client.subscribe(ATTRIBUTE_TOPIC);
     }
+
+    if (m_gateway_rpc_callback.isCallbackSet()) {
+      m_client.subscribe(GATEWAY_CONNECT_TOPIC);
+    }
   }
 
 #if !THINGSBOARD_ENABLE_DYNAMIC
@@ -1612,7 +1707,7 @@ class ThingsBoardSized {
   /// @return Whether requesting the given callback was successful or not
   inline bool
   Attributes_Request_Subscribe(const Attribute_Request_Callback& callback,
-                               Attribute_Request_Callback*& registeredCallback = nullptr) {
+    Attribute_Request_Callback*& registeredCallback = nullptr) {
 #if !THINGSBOARD_ENABLE_DYNAMIC
     if (m_attribute_request_callbacks.size() + 1 > m_attribute_request_callbacks.capacity()) {
       Logger::log(MAX_SHARED_ATT_REQUEST_EXCEEDED);
@@ -2020,6 +2115,54 @@ class ThingsBoardSized {
     Provision_Unsubscribe();
   }
 
+  inline void process_gateway_rpc_message(char* topic, const JsonObjectConst& data) {
+    // data example: {"device":"myDevice", "data": {"id":12, "method":"cmd", "params":"testing"}}
+    if (!data.containsKey(GATEWAY_RPC_DEVICE_KEY) || !data.containsKey(GATEWAY_RPC_DATA_KEY)) {
+#if THINGSBOARD_ENABLE_DEBUG
+      Logger::log("Gateway RPC key missing");
+#endif
+      return;
+    }
+
+    const char* device = data[GATEWAY_RPC_DEVICE_KEY].as<const char*>();
+    const char* method = data[GATEWAY_RPC_DATA_KEY][GATEWAY_RPC_METHOD_KEY].as<const char*>();
+    const char* params = data[GATEWAY_RPC_DATA_KEY][GATEWAY_RPC_PARAMS_KEY].as<const char*>();
+
+    if (device == nullptr || method == nullptr || params == nullptr) {
+#if THINGSBOARD_ENABLE_DEBUG
+      Logger::log("Gateway RPC data missing");
+#endif
+      return;
+    }
+
+    // Create json buffer to hold pointers to data object to avoid copying
+    StaticJsonDocument<JSON_OBJECT_SIZE(MaxFieldsAmt)> json_buffer;
+    const JsonObject object = json_buffer.template to<JsonObject>();
+
+    // object example: {"device":"myDevice", "method":"cmd", "params":"testing"}
+    object[GATEWAY_RPC_DEVICE_KEY] = device;
+    object[GATEWAY_RPC_METHOD_KEY] = method;
+    object[GATEWAY_RPC_PARAMS_KEY] = params;
+
+    RPC_Response response = m_gateway_rpc_callback.Call_Callback<Logger>(object);
+
+    if (response.isNull()) {
+      // Message is ignored and not sent at all.
+      return;
+    }
+
+    // Clear json buffer before reusing it
+    json_buffer.clear();
+
+    // object example: {"device":"myDevice", "id": 12, "data": {"success": true}}
+    object[GATEWAY_RPC_DEVICE_KEY] = device;
+    object[GATEWAY_RPC_ID_KEY]     = data[GATEWAY_RPC_DATA_KEY][GATEWAY_RPC_ID_KEY];
+    object[GATEWAY_RPC_DATA_KEY]   = response;
+
+    const size_t jsonSize = Helper::Measure_Json(object);
+    Send_Json(GATEWAY_RPC_TOPIC, object, jsonSize);
+  }
+
   /// @brief Attempts to send aggregated attribute or telemetry data
   /// @param data Array containing all the data we want to send
   /// @param data_count Amount of data entries in the array that we want to send
@@ -2081,7 +2224,9 @@ class ThingsBoardSized {
     m_attribute_request_callbacks; // Client-side or shared attribute request callback vector,
                                    // replacement for non C++ STL boards
 
-  Provision_Callback m_provision_callback; // Provision response callback
+  Provision_Callback m_provision_callback;     // Provision response callback
+  Gateway_RPC_Callback m_gateway_rpc_callback; // Gateway RPC callback
+
   size_t m_request_id; // Allows nearly 4.3 million requests before wrapping back to 0
 
 #if THINGSBOARD_ENABLE_OTA
@@ -2163,6 +2308,8 @@ class ThingsBoardSized {
       process_shared_attribute_update_message(topic, data);
     } else if (strncmp_P(PROV_RESPONSE_TOPIC, topic, strlen(PROV_RESPONSE_TOPIC)) == 0) {
       process_provisioning_response(topic, data);
+    } else if (strncmp_P(GATEWAY_RPC_TOPIC, topic, strlen(GATEWAY_RPC_TOPIC)) == 0) {
+      process_gateway_rpc_message(topic, data);
     }
   }
 

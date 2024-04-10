@@ -2134,11 +2134,13 @@ class ThingsBoardSized {
       return;
     }
 
+    // "device" and "method" must contain a string
+    // "params" could be a string or an object
     const char* device = data[GATEWAY_RPC_DEVICE_KEY].as<const char*>();
     const char* method = data[GATEWAY_RPC_DATA_KEY][GATEWAY_RPC_METHOD_KEY].as<const char*>();
-    const char* params = data[GATEWAY_RPC_DATA_KEY][GATEWAY_RPC_PARAMS_KEY].as<const char*>();
 
-    if (device == nullptr || method == nullptr || params == nullptr) {
+    if (device == nullptr || method == nullptr ||
+        !data[GATEWAY_RPC_DATA_KEY].containsKey(GATEWAY_RPC_PARAMS_KEY)) {
 #if THINGSBOARD_ENABLE_DEBUG
       Logger::log("Gateway RPC data missing");
 #endif
@@ -2149,10 +2151,11 @@ class ThingsBoardSized {
     StaticJsonDocument<JSON_OBJECT_SIZE(MaxFieldsAmt)> json_buffer;
     const JsonObject object = json_buffer.template to<JsonObject>();
 
-    // object example: {"device":"myDevice", "method":"cmd", "params":"testing"}
+    // object example 1: {"device":"myDevice", "method":"cmd", "params":"testing"}
+    // object example 2: {"device":"myDevice", "method":"cmd", "params":{"key":"value"}}
     object[GATEWAY_RPC_DEVICE_KEY] = device;
     object[GATEWAY_RPC_METHOD_KEY] = method;
-    object[GATEWAY_RPC_PARAMS_KEY] = params;
+    object[GATEWAY_RPC_PARAMS_KEY] = data[GATEWAY_RPC_DATA_KEY][GATEWAY_RPC_PARAMS_KEY];
 
     RPC_Response response = m_gateway_rpc_callback.Call_Callback<Logger>(object);
 
